@@ -41,8 +41,8 @@ func (s *AriesParser) parse(data []byte) {
 
 func parseKeyValueString(input string) map[string]string {
 	result := make(map[string]string)
-	lines := strings.Split(input, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(input, "\n")
+	for line := range lines {
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
