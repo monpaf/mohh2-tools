@@ -11,10 +11,10 @@ var (
 	input string
 )
 
-// isoCmd represents the iso command
-var isoCmd = &cobra.Command{
-	Use:   "iso",
-	Short: "Extract the contents of ISO/RVZ files or apply user defined patches",
+// imageCmd represents the image command
+var imageCmd = &cobra.Command{
+	Use:   "image",
+	Short: "Extract all game data of ISO/WBFS/RVZ files or apply user defined patches",
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		if _, err := os.Stat(input); os.IsNotExist(err) {
 			fmt.Println("Input file not found")
@@ -24,8 +24,8 @@ var isoCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(isoCmd)
+	rootCmd.AddCommand(imageCmd)
 
-	isoCmd.PersistentFlags().StringVarP(&input, "input", "i", "", "Input ISO|RVZ file")
-	isoCmd.MarkPersistentFlagRequired("input")
+	imageCmd.PersistentFlags().StringVarP(&input, "input", "i", "", "Input ISO|WBFS|RVZ file")
+	imageCmd.MarkPersistentFlagRequired("input")
 }

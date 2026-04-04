@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -16,7 +17,7 @@ import (
 var PatchCfg PatchConfig
 
 func PackRvz(output string) {
-	fmt.Println("Packing RVZ")
+	fmt.Println("Building image...")
 	if _, err := os.Stat(output); err == nil {
 		os.Remove(output)
 	}
@@ -27,7 +28,7 @@ func PackRvz(output string) {
 }
 
 func PackIso(output string) {
-	fmt.Println("Packing ISO")
+	fmt.Println("Building image...")
 	out, err := exec.Command("cmd", "/C", filepath.Join("tools", "wit.exe"), "cp", filepath.Join(utils.TempDir, "data"), output, "-o").CombinedOutput()
 	if err != nil {
 		fmt.Println(string(out))
@@ -124,6 +125,11 @@ func applyBoolPatch(patch Patch, value bool) {
 
 		filePath := filepath.Join(utils.TempDir, "data", changes.File.Path)
 		f, err := os.OpenFile(filePath, os.O_RDWR, 0644)
+		if err != nil && (strings.HasPrefix(changes.File.Path, "DATA/") || strings.HasPrefix(changes.File.Path, "DATA\\")) {
+			strippedPath := strings.TrimPrefix(strings.TrimPrefix(changes.File.Path, "DATA/"), "DATA\\")
+			filePath = filepath.Join(utils.TempDir, "data", strippedPath)
+			f, err = os.OpenFile(filePath, os.O_RDWR, 0644)
+		}
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -171,6 +177,11 @@ func applyIntPatch(patch Patch, value int, restore bool) {
 
 		filePath := filepath.Join(utils.TempDir, "data", changes.File.Path)
 		f, err := os.OpenFile(filePath, os.O_RDWR, 0644)
+		if err != nil && (strings.HasPrefix(changes.File.Path, "DATA/") || strings.HasPrefix(changes.File.Path, "DATA\\")) {
+			strippedPath := strings.TrimPrefix(strings.TrimPrefix(changes.File.Path, "DATA/"), "DATA\\")
+			filePath = filepath.Join(utils.TempDir, "data", strippedPath)
+			f, err = os.OpenFile(filePath, os.O_RDWR, 0644)
+		}
 		if err != nil {
 			fmt.Println(err)
 			return

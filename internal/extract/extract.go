@@ -22,14 +22,13 @@ func ExtractToGameDir(input string) {
 
 func Extract(input string) {
 	if _, err := os.Stat(filepath.Join("tools", "DolphinTool.exe")); os.IsNotExist(err) {
-		fmt.Println("Download Dolphin Emulator and extract DolphinTool.exe to the tools directory")
-		os.Exit(1)
+		utils.DownloadDolphinTool()
 	}
 
 	var witTools = []string{"wit.exe", "cygwin1.dll", "cygcrypto-1.1.dll", "cygncursesw-10.dll", "cygz.dll"}
 	for _, tool := range witTools {
 		if _, err := os.Stat(filepath.Join("tools", tool)); os.IsNotExist(err) {
-			utils.DonwloadWitTools()
+			utils.DownloadWitTools()
 			break
 		}
 	}
@@ -45,13 +44,13 @@ func Extract(input string) {
 			os.Exit(1)
 		}
 		extractIso(filepath.Join(utils.TempDir, "temp.iso"))
-	} else if filepath.Ext(input) == ".iso" {
+	} else if filepath.Ext(input) == ".iso" || filepath.Ext(input) == ".wbfs" {
 		extractIso(input)
 	}
 }
 
 func extractIso(input string) {
-	fmt.Println("Extracting ISO...")
+	fmt.Println("Extracting image...")
 	out, err := exec.Command("cmd", "/C", filepath.Join("tools", "wit.exe"), "x", input, filepath.Join(utils.TempDir, "data")).CombinedOutput()
 	if err != nil {
 		CleanUp()
@@ -60,7 +59,7 @@ func extractIso(input string) {
 	}
 	if _, err := os.Stat(filepath.Join(utils.TempDir, "data")); os.IsNotExist(err) {
 		CleanUp()
-		fmt.Println("Error extracting ISO")
+		fmt.Println("Error extracting image")
 		os.Exit(1)
 	}
 }
