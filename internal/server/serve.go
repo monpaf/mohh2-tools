@@ -40,7 +40,7 @@ func Serve(tcp1Port string, tcp2Port string, udpPort string, logLevel string) {
 
 	go func() {
 		defer wg.Done()
-		StartTCPServer(tcp1Port)
+		StartSSLServer(tcp1Port)
 	}()
 	go func() {
 		defer wg.Done()
