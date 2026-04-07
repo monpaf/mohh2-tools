@@ -7,15 +7,18 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strconv"
+	"net/url"
 	"strings"
 
 	"github.com/fatih/color"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 type AriesParser struct {
 	conn          net.Conn
 	messageBuffer []byte
+	currentUser   *User
 }
 
 func NewAriesParser(conn net.Conn) *AriesParser {
@@ -41,12 +44,15 @@ func (s *AriesParser) parse(data []byte) {
 
 func parseKeyValueString(input string) map[string]string {
 	result := make(map[string]string)
-	lines := strings.SplitSeq(input, "\n")
-	for line := range lines {
+	lines := strings.Split(input, "\n")
+	for _, line := range lines {
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
+			if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+				value = value[1 : len(value)-1]
+			}
 			result[key] = value
 		}
 	}
@@ -55,8 +61,13 @@ func parseKeyValueString(input string) map[string]string {
 
 func (s *AriesParser) parseMessage(message []byte) {
 	kind := string(message[0:4])
-	// packetSize := binary.BigEndian.Uint32(message[8:12])
-	// content := string(message[12:packetSize])
+	packetSize := binary.BigEndian.Uint32(message[8:12])
+	content := ""
+	if packetSize > 12 {
+		content = string(message[12:packetSize])
+		content = strings.TrimRight(content, "\x00")
+	}
+
 	slog.Debug(color.MagentaString("TCP <--\n") + color.CyanString(hex.Dump(message)))
 
 	switch kind {
@@ -68,9 +79,6 @@ func (s *AriesParser) parseMessage(message []byte) {
 	case "sele":
 		s.seleResponse(kind)
 	case "gpsc":
-		packetSize := binary.BigEndian.Uint32(message[8:12])
-		content := string(message[12:packetSize])
-
 		s.sendSes(parseKeyValueString(content))
 	case "llvl":
 		s.llvlResponse(kind)
@@ -82,85 +90,93 @@ func (s *AriesParser) parseMessage(message []byte) {
 	case "gsea":
 		s.gseaResponse(kind)
 	case "pers":
-		s.persResponse(kind)
-		s.sendWho()
+		s.persResponse(kind, parseKeyValueString(content))
 	case "skey":
 		s.skeyResponse(kind)
 	case "news":
 		s.newsResponse(kind)
 	case "auth":
-		s.authResponse(kind)
+		s.authResponse(kind, parseKeyValueString(content))
 	default:
 		slog.Warn("Unknown packet type", "kind", kind)
 	}
 }
 
-func (s *AriesParser) gseaResponse(kind string) {
+func (s *AriesParser) authResponse(kind string, params map[string]string) {
+	name := params["NAME"]
+	encryptedPass := params["PASS"]
+
+	user, ok := DB.GetUserByName(name)
+	if !ok {
+		slog.Warn("Auth failed: user not found", "name", name)
+		return
+	}
+
+	passToDecrypt := strings.TrimPrefix(encryptedPass, "~")
+
+	decodedPass, err := url.QueryUnescape(passToDecrypt)
+	if err != nil {
+		slog.Error("Failed to URL decode password", "err", err)
+		decodedPass = passToDecrypt
+	}
+
+	key := []byte{0x51, 0xba, 0x8a, 0xee, 0x64, 0xdd, 0xfa, 0xca, 0xe5, 0xba, 0xef, 0xa6, 0xbf, 0x61, 0xe0, 0x09}
+	decryptedPass := CryptSSC2StringDecrypt([]byte(decodedPass), key, 16)
+	slog.Debug("Password decryption", "encrypted", encryptedPass, "decrypted", decryptedPass, "expected", user.Password)
+
+	if decryptedPass != user.Password {
+		slog.Warn("Auth failed: password mismatch", "name", name)
+		return
+	}
+
+	s.currentUser = &user
+
 	content := map[string]string{
-		"COUNT": "0",
+		"LOC":      "enCZ",
+		"MAIL":     user.Email,
+		"PERSONAS": cases.Title(language.English).String(user.Name),
+		"NAME":     user.Name,
+		"ADDR":     "127.0.0.1",
+		"SPAM":     "NN",
 	}
 	s.send(kind, content)
 }
 
-func (s *AriesParser) sendSes(receivedContent map[string]string) {
-	content := map[string]string{
-		"IDENT":   "12",
-		"NAME":    "Player",
-		"HOST":    "Player",
-		"GPSHOST": "Player",
-		// "PARAMS":  "8,12d,,,-1,,,1e,,-1,1,1,1,1,1,1,1,1,20,,,15f90,122d0022",
-		"PARAMS": receivedContent["PARAMS"],
-		// ["PLATPARAMS": "0",  // ???
-		"ROOM":      "13",
-		"CUSTFLAGS": "0",
-		"SYSFLAGS":  "262656",
-		"COUNT":     "1",
-		"PRIV":      "0",
-		"MINSIZE":   "0",
-		"MAXSIZE":   "33",
-		"NUMPART":   "1",
-		"SEED":      "012345", // random seed
-		"WHEN":      "2009.2.8-9:44:15",
-		"GAMEPORT":  "21172",
-		"VOIPPORT":  "21172",
-		// ["GAMEMODE": "0", // ???
-		// ["AUTH": "0", // ???
+func (s *AriesParser) persResponse(kind string, params map[string]string) {
+	persona := params["PERS"]
 
-		// loop 0x80022058 only if COUNT>=0
-		"OPID0":  "0",             // OPID%d
-		"OPPO0":  "Player",        // OPPO%d
-		"ADDR0":  "127.0.0.1",     // ADDR%d
-		"LADDR0": "127.0.0.1",     // LADDR%d
-		"MADDR0": "$0017ab8f4451", // MADDR%d
-		// ["OPPART0": "0", // OPPART%d
-		"OPPARAM0": "AAAAAAAAAAAAAAAAAAAAAQBuDCgAAAAC", // OPPARAM%d
-		// ["OPFLAGS0": "0", // OPFLAGS%d
-		// ["PRES0": "0", // PRES%d ???
-
-		// another loop 0x8002225C only if NUMPART>=0
-		"PARTSIZE0":   "16", // PARTSIZE%d
-		"PARTPARAMS0": "0",  // PARTPARAMS%d
-		// "SESS": "0", %s-%s-%08x 0--498ea96f
+	name := "Player"
+	if s.currentUser != nil {
+		name = cases.Title(language.English).String(s.currentUser.Name)
 	}
-	s.send("+ses", content)
-}
 
-func (s *AriesParser) sendGam(index int, name string) {
 	content := map[string]string{
-		"IDENT":    fmt.Sprintf("%d", index),
-		"NAME":     name,
-		"PARAMS":   "8,12d,,,-1,,,1e,,-1,1,1,1,1,1,1,1,1,20,,,15f90,122d0022",
-		"SYSFLAGS": "262656",
-		"COUNT":    "0",
-		"MAXSIZE":  "33",
+		"LKEY":      "95feb0c73354764fc8446aee5644c429bc9ce4ddb6fe4d953e897e05f717a9c",
+		"LOC":       "enCZ",
+		"A":         "127.0.0.1",
+		"PERS":      name,
+		"LA":        "127.0.0.1",
+		"IDLE":      "100000",
+		"EX-ticker": "",
 	}
-	s.send("+gam", content)
+
+	if persona != "" {
+		content["PERS"] = persona
+	}
+
+	s.send(kind, content)
+	s.sendWho()
 }
 
 func (s *AriesParser) sendWho() {
+	name := "Player"
+	if s.currentUser != nil {
+		name = cases.Title(language.English).String(s.currentUser.Name)
+	}
+
 	content := map[string]string{
 		"I":   "71615",
-		"N":   "Player",
+		"N":   name,
 		"F":   "U",
 		"P":   "211",
 		"S":   "1,2,3,4,5,6,7,493E0,C350",
@@ -174,7 +190,7 @@ func (s *AriesParser) sendWho() {
 		"US":  "0",
 		"HW":  "0",
 		"RP":  "0",
-		"LO":  "frFR",
+		"LO":  "enCZ",
 		"CI":  "0",
 		"CT":  "0",
 		"A":   "127.0.0.1",
@@ -190,37 +206,10 @@ func (s *AriesParser) sendWho() {
 	s.send("+who", content)
 }
 
-func (s *AriesParser) dummyResponse(kind string) {
+func (s *AriesParser) dirResponse(kind string) {
 	content := map[string]string{
-		"DUMMY": "DUMMY",
-	}
-	s.send(kind, content)
-}
-
-func (s *AriesParser) ping() {
-	// content := map[string]string{
-	//	 "REF": "123",
-	// }
-	// s.send("~png", content)
-}
-
-func (s *AriesParser) llvlResponse(kind string) {
-	content := map[string]string{
-		"SKILL_PTS": "211",
-		"SKILL_LVL": "1049601",
-		"SKILL":     "",
-	}
-	s.send(kind, content)
-}
-
-func (s *AriesParser) authResponse(kind string) {
-	content := map[string]string{
-		"NAME":     "Player",
-		"ADDR":     "127.0.0.1",
-		"PERSONAS": "Player",
-		"LOC":      "frFR",
-		"MAIL":     "player@gmail.com",
-		"SPAM":     "NN",
+		"ADDR": "127.0.0.1",
+		"PORT": "21172",
 	}
 	s.send(kind, content)
 }
@@ -230,6 +219,13 @@ func (s *AriesParser) seleResponse(kind string) {
 		"MORE":  "0",
 		"SLOTS": "4",
 		"STATS": "0",
+	}
+	s.send(kind, content)
+}
+
+func (s *AriesParser) gseaResponse(kind string) {
+	content := map[string]string{
+		"COUNT": "0",
 	}
 	s.send(kind, content)
 }
@@ -249,46 +245,69 @@ func (s *AriesParser) skeyResponse(kind string) {
 	s.send(kind, content)
 }
 
-func (s *AriesParser) dirResponse(kind string) {
+func (s *AriesParser) llvlResponse(kind string) {
 	content := map[string]string{
-		"ADDR": "127.0.0.1",
-		"PORT": "21172",
+		"SKILL_PTS": "211",
+		"SKILL_LVL": "1049601",
+		"SKILL":     "",
 	}
 	s.send(kind, content)
 }
 
-func (s *AriesParser) sendRom(kind string, index int, name string) {
+func (s *AriesParser) dummyResponse(kind string) {
 	content := map[string]string{
-		"N": name,
-		"I": strconv.Itoa(index),
-		"H": "test",
-		"F": "CK",
-		"T": "0",
-		"L": "50",
+		"DUMMY": "DUMMY",
 	}
 	s.send(kind, content)
 }
 
-func (s *AriesParser) persResponse(kind string) {
-	content := map[string]string{
-		"PERS":      "Player",
-		"LKEY":      "3fcf27540c92935b0a66fd3b0000283c",
-		"EX-ticker": "",
-		"LOC":       "frFR",
-		"A":         "127.0.0.1",
-		"LA":        "127.0.0.1",
-		"IDLE":      "6000000",
+func (s *AriesParser) sendSes(receivedContent map[string]string) {
+	name := "Player"
+	if s.currentUser != nil {
+		name = cases.Title(language.English).String(s.currentUser.Name)
 	}
-	s.send(kind, content)
+
+	content := map[string]string{
+		"IDENT":       "12",
+		"NAME":        name,
+		"HOST":        name,
+		"GPSHOST":     name,
+		"PARAMS":      receivedContent["PARAMS"],
+		"ROOM":        "13",
+		"CUSTFLAGS":   "0",
+		"SYSFLAGS":    "262656",
+		"COUNT":       "1",
+		"PRIV":        "0",
+		"MINSIZE":     "0",
+		"MAXSIZE":     "33",
+		"NUMPART":     "1",
+		"SEED":        "012345",
+		"WHEN":        "2009.2.8-9:44:15",
+		"GAMEPORT":    "21172",
+		"VOIPPORT":    "21172",
+		"OPID0":       "0",
+		"OPPO0":       name,
+		"ADDR0":       "127.0.0.1",
+		"LADDR0":      "127.0.0.1",
+		"MADDR0":      "$0017ab8f4451",
+		"OPPARAM0":    "AAAAAAAAAAAAAAAAAAAAAQBuDCgAAAAC",
+		"PARTSIZE0":   "16",
+		"PARTPARAMS0": "0",
+	}
+	s.send("+ses", content)
 }
 
 func (s *AriesParser) send(kind string, content map[string]string) {
 	var msgBuffer bytes.Buffer
-	totalItems := len(content)
-	for key, value := range content {
-		msgBuffer.WriteString(fmt.Sprintf("%s=%s", key, value))
-		totalItems--
-		if totalItems > 0 {
+
+	keys := make([]string, 0, len(content))
+	for k := range content {
+		keys = append(keys, k)
+	}
+
+	for i, key := range keys {
+		fmt.Fprintf(&msgBuffer, "%s=%s", key, content[key])
+		if i < len(keys)-1 {
 			msgBuffer.WriteString("\n")
 		}
 	}
@@ -304,7 +323,7 @@ func (s *AriesParser) send(kind string, content map[string]string) {
 
 	_, err := s.conn.Write(buffer)
 	if err != nil {
-		slog.Error("Could not write to TCP connection", "localAddr", s.conn.LocalAddr(), "remoteAddr", s.conn.RemoteAddr(), "err", err)
+		slog.Error("Could not write to TCP connection", "err", err)
 		return
 	}
 }

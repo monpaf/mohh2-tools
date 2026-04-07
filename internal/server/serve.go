@@ -12,6 +12,7 @@ import (
 )
 
 func Serve(tcp1Port string, tcp2Port string, udpPort string, logLevel string) {
+	InitDB()
 	lvl := new(slog.LevelVar)
 	logger := slog.New(
 		tint.NewHandler(color.Output, &tint.Options{
