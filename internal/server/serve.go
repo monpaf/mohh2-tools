@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -11,8 +12,27 @@ import (
 	"github.com/lmittmann/tint"
 )
 
-func Serve(tcp1Port string, tcp2Port string, udpPort string, logLevel string) {
-	InitDB()
+type server struct {
+	mu      sync.RWMutex
+	gpsUser string
+	sslPort string
+	tcpPort string
+	udpPort string
+	db      *memoryDB
+}
+
+func newServer(sslPort, tcpPort, udpPort string) *server {
+	return &server{
+		sslPort: sslPort,
+		tcpPort: tcpPort,
+		udpPort: udpPort,
+		db:      newDB(),
+	}
+}
+
+func Serve(sslPort, tcpPort, udpPort, logLevel string) {
+	s := newServer(sslPort, tcpPort, udpPort)
+
 	lvl := new(slog.LevelVar)
 	logger := slog.New(
 		tint.NewHandler(color.Output, &tint.Options{
@@ -37,19 +57,38 @@ func Serve(tcp1Port string, tcp2Port string, udpPort string, logLevel string) {
 
 	var wg sync.WaitGroup
 
-	wg.Add(3)
+	// wg.Add(3)
+	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		StartSSLServer(tcp1Port)
+		s.StartSSLServer(sslPort)
 	}()
 	go func() {
 		defer wg.Done()
-		StartTCPServer(tcp2Port)
+		s.StartTCPServer(tcpPort)
 	}()
-	go func() {
-		defer wg.Done()
-		StartUDPServer(udpPort)
-	}()
+	// go func() {
+	// 	defer wg.Done()
+	// 	s.StartUDPServer(udpPort)
+	// }()
 	wg.Wait()
+}
+
+func (s *server) handleConnection(conn net.Conn) {
+	buffer := make([]byte, 1024)
+	parser := NewAriesParser(conn, s)
+
+	for {
+		n, err := conn.Read(buffer)
+		if err != nil {
+			if err.Error() == "EOF" {
+				slog.Info("TCP connection closed by client", "localAddr", conn.LocalAddr(), "remoteAddr", conn.RemoteAddr())
+				return
+			}
+			slog.Error("Could not read from TCP connection", "localAddr", conn.LocalAddr(), "remoteAddr", conn.RemoteAddr(), "err", err)
+			return
+		}
+		parser.parse(buffer[:n])
+	}
 }

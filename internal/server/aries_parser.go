@@ -17,14 +17,21 @@ import (
 
 type AriesParser struct {
 	conn          net.Conn
+	server        *server
 	messageBuffer []byte
 	currentUser   *User
+	isGps         bool
+	remoteAddr    string
 }
 
-func NewAriesParser(conn net.Conn) *AriesParser {
+func NewAriesParser(conn net.Conn, s *server) *AriesParser {
 	return &AriesParser{
 		conn:          conn,
+		server:        s,
 		messageBuffer: make([]byte, 0),
+		currentUser:   nil,
+		isGps:         false,
+		remoteAddr:    conn.RemoteAddr().(*net.TCPAddr).IP.String(),
 	}
 }
 
@@ -44,8 +51,8 @@ func (s *AriesParser) parse(data []byte) {
 
 func parseKeyValueString(input string) map[string]string {
 	result := make(map[string]string)
-	lines := strings.Split(input, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(input, "\n")
+	for line := range lines {
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
@@ -68,14 +75,25 @@ func (s *AriesParser) parseMessage(message []byte) {
 		content = strings.TrimRight(content, "\x00")
 	}
 
-	slog.Debug(color.MagentaString("TCP <--\n") + color.CyanString(hex.Dump(message)))
+	username := ""
+	if s.currentUser != nil {
+		username = s.currentUser.Name
+		if s.isGps {
+			username = color.RedString(" [GPS]")
+		}
+	}
+
+	slog.Debug(fmt.Sprintf("%s %s\n%s",
+		color.MagentaString("TCP <--"),
+		username,
+		color.CyanString("\n"+hex.Dump(message))))
 
 	switch kind {
 	case "~png":
 	case "@tic":
 	case "addr":
 	case "@dir":
-		s.dirResponse(kind)
+		s.dirResponse(kind, parseKeyValueString(content))
 	case "sele":
 		s.seleResponse(kind)
 	case "gpsc":
@@ -103,10 +121,10 @@ func (s *AriesParser) parseMessage(message []byte) {
 }
 
 func (s *AriesParser) authResponse(kind string, params map[string]string) {
-	name := params["NAME"]
+	name := strings.TrimPrefix(params["NAME"], "@")
 	encryptedPass := params["PASS"]
 
-	user, ok := DB.GetUserByName(name)
+	user, ok := s.server.db.GetUserByName(name)
 	if !ok {
 		slog.Warn("Auth failed: user not found", "name", name)
 		return
@@ -129,14 +147,14 @@ func (s *AriesParser) authResponse(kind string, params map[string]string) {
 		return
 	}
 
-	s.currentUser = &user
+	s.currentUser = user
 
 	content := map[string]string{
 		"LOC":      "enCZ",
 		"MAIL":     user.Email,
 		"PERSONAS": cases.Title(language.English).String(user.Name),
 		"NAME":     user.Name,
-		"ADDR":     "127.0.0.1",
+		"ADDR":     s.remoteAddr,
 		"SPAM":     "NN",
 	}
 	s.send(kind, content)
@@ -153,9 +171,9 @@ func (s *AriesParser) persResponse(kind string, params map[string]string) {
 	content := map[string]string{
 		"LKEY":      "95feb0c73354764fc8446aee5644c429bc9ce4ddb6fe4d953e897e05f717a9c",
 		"LOC":       "enCZ",
-		"A":         "127.0.0.1",
+		"A":         s.remoteAddr,
 		"PERS":      name,
-		"LA":        "127.0.0.1",
+		"LA":        s.remoteAddr,
 		"IDLE":      "100000",
 		"EX-ticker": "",
 	}
@@ -193,8 +211,8 @@ func (s *AriesParser) sendWho() {
 		"LO":  "enCZ",
 		"CI":  "0",
 		"CT":  "0",
-		"A":   "127.0.0.1",
-		"LA":  "127.0.0.1",
+		"A":   s.remoteAddr,
+		"LA":  s.remoteAddr,
 		"C":   "4000,,7,1,1,,1,1,5553",
 		"RI":  "0",
 		"RT":  "0",
@@ -206,10 +224,16 @@ func (s *AriesParser) sendWho() {
 	s.send("+who", content)
 }
 
-func (s *AriesParser) dirResponse(kind string) {
+func (s *AriesParser) dirResponse(kind string, params map[string]string) {
+	version := params["VERS"]
+
+	if version == "PSP/MOHGPS071" {
+		s.isGps = true
+	}
+
 	content := map[string]string{
-		"ADDR": "127.0.0.1",
-		"PORT": "21172",
+		"ADDR": s.remoteAddr,
+		"PORT": s.server.tcpPort,
 	}
 	s.send(kind, content)
 }
@@ -232,8 +256,8 @@ func (s *AriesParser) gseaResponse(kind string) {
 
 func (s *AriesParser) newsResponse(kind string) {
 	content := map[string]string{
-		"BUDDY_SERVER": "127.0.0.1",
-		"BUDDY_PORT":   "21172",
+		"BUDDY_SERVER": s.remoteAddr,
+		"BUDDY_PORT":   s.server.tcpPort,
 	}
 	s.send(kind, content)
 }
@@ -283,12 +307,12 @@ func (s *AriesParser) sendSes(receivedContent map[string]string) {
 		"NUMPART":     "1",
 		"SEED":        "012345",
 		"WHEN":        "2009.2.8-9:44:15",
-		"GAMEPORT":    "21172",
-		"VOIPPORT":    "21172",
+		"GAMEPORT":    s.server.tcpPort,
+		"VOIPPORT":    s.server.tcpPort,
 		"OPID0":       "0",
 		"OPPO0":       name,
-		"ADDR0":       "127.0.0.1",
-		"LADDR0":      "127.0.0.1",
+		"ADDR0":       s.remoteAddr,
+		"LADDR0":      s.remoteAddr,
 		"MADDR0":      "$0017ab8f4451",
 		"OPPARAM0":    "AAAAAAAAAAAAAAAAAAAAAQBuDCgAAAAC",
 		"PARTSIZE0":   "16",
@@ -319,7 +343,19 @@ func (s *AriesParser) send(kind string, content map[string]string) {
 	binary.BigEndian.PutUint32(buffer[4:], 0)
 	binary.BigEndian.PutUint32(buffer[8:], uint32(len(buffer)))
 	copy(buffer[12:], msgBuffer.Bytes())
-	slog.Debug(color.MagentaString("TCP -->\n") + color.YellowString(hex.Dump(buffer)))
+
+	username := ""
+	if s.currentUser != nil {
+		username = s.currentUser.Name
+		if s.isGps {
+			username = color.RedString(" [GPS]")
+		}
+	}
+
+	slog.Debug(fmt.Sprintf("%s %s\n%s",
+		color.MagentaString("TCP -->"),
+		username,
+		color.YellowString("\n"+hex.Dump(buffer))))
 
 	_, err := s.conn.Write(buffer)
 	if err != nil {

@@ -13,41 +13,42 @@ type User struct {
 }
 
 // MemoryDB is a simple in-memory database
-type MemoryDB struct {
+type memoryDB struct {
 	mu     sync.RWMutex
-	users  map[int]User
+	users  map[int]*User
 	nextID int
 }
 
-var DB *MemoryDB
-
-// InitDB initializes the in-memory database with some default data
-func InitDB() {
-	DB = &MemoryDB{
-		users:  make(map[int]User),
+// newDB initializes the in-memory database with some default data
+func newDB() *memoryDB {
+	db := &memoryDB{
+		users:  make(map[int]*User),
 		nextID: 1,
 	}
 
-	DB.AddUser("labeo", "pass", "labeo@ea.com")
+	db.addUser("labeo", "pass", "labeo@ea.com")
+	db.addUser("gigi", "pass", "labeo@ea.com")
+
+	return db
 }
 
-// AddUser adds a new user to the database
-func (db *MemoryDB) AddUser(name, password, email string) {
+// addUser adds a new user to the database
+func (db *memoryDB) addUser(name, password, email string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	user := User{
+	id := db.nextID
+	db.users[id] = &User{
 		ID:       db.nextID,
 		Name:     name,
 		Password: password,
 		Email:    email,
 	}
-	db.users[user.ID] = user
 	db.nextID++
 }
 
 // GetUserByName retrieves a user by their name
-func (db *MemoryDB) GetUserByName(name string) (User, bool) {
+func (db *memoryDB) GetUserByName(name string) (*User, bool) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -56,14 +57,14 @@ func (db *MemoryDB) GetUserByName(name string) (User, bool) {
 			return user, true
 		}
 	}
-	return User{}, false
+	return nil, false
 }
 
 // GetUserByID retrieves a user by their ID
-func (db *MemoryDB) GetUserByID(id int) (User, bool) {
+func (db *memoryDB) GetUserByID(id int) (*User, bool) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	user, ok := db.users[id]
-	return user, ok
+	user, exists := db.users[id]
+	return user, exists
 }

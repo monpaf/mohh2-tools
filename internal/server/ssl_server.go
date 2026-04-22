@@ -115,8 +115,8 @@ func GenerateProtoSSLCert(domain string) (tls.Certificate, error) {
 	}, nil
 }
 
-func StartSSLServer(port string) {
-	cert, err := GenerateProtoSSLCert("wiimoh08.ea.com")
+func (s *server) StartSSLServer(port string) {
+	cert, err := GenerateProtoSSLCert("pspmoh07.ea.com")
 	if err != nil {
 		slog.Error("Could not generate ProtoSSL certificate", "err", err)
 		return
@@ -133,7 +133,7 @@ func StartSSLServer(port string) {
 		InsecureSkipVerify: true,
 	}
 
-	ln, err := tls.Listen("tcp", "localhost:"+port, config)
+	ln, err := tls.Listen("tcp", ":"+port, config)
 	if err != nil {
 		slog.Error("Could not start SSL server", "port", port, "err", err)
 		return
@@ -150,6 +150,6 @@ func StartSSLServer(port string) {
 
 		slog.Info("SSL connection accepted", "localAddr", ln.Addr(), "remoteAddr", conn.RemoteAddr())
 
-		go handleConnection(conn)
+		go s.handleConnection(conn)
 	}
 }

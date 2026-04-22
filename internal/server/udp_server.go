@@ -10,8 +10,8 @@ import (
 	"github.com/fatih/color"
 )
 
-func StartUDPServer(port string) {
-	ln, err := net.ListenPacket("udp", "localhost:"+port)
+func (s *server) StartUDPServer(port string) {
+	ln, err := net.ListenPacket("udp", ":"+port)
 	if err != nil {
 		slog.Error("Could not start UDP server", "addr", ln.LocalAddr(), "err", err)
 		os.Exit(1)
