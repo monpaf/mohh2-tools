@@ -6,10 +6,11 @@ import (
 
 // User represents a user record in the database
 type User struct {
-	ID       int
-	Name     string
-	Password string
-	Email    string
+	ID          int
+	Name        string
+	DisplayName string
+	Password    string
+	Email       string
 }
 
 // MemoryDB is a simple in-memory database
@@ -26,23 +27,24 @@ func newDB() *memoryDB {
 		nextID: 1,
 	}
 
-	db.addUser("labeo", "pass", "labeo@ea.com")
-	db.addUser("gigi", "pass", "labeo@ea.com")
+	db.addUser("labeo", "Labeo", "pass", "labeo@ea.com")
+	db.addUser("gigi", "GIGI 88 OiOi", "pass", "GIGI 88 OiOi@ea.com")
 
 	return db
 }
 
 // addUser adds a new user to the database
-func (db *memoryDB) addUser(name, password, email string) {
+func (db *memoryDB) addUser(name, displayName, password, email string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	id := db.nextID
 	db.users[id] = &User{
-		ID:       db.nextID,
-		Name:     name,
-		Password: password,
-		Email:    email,
+		ID:          db.nextID,
+		Name:        name,
+		DisplayName: displayName,
+		Password:    password,
+		Email:       email,
 	}
 	db.nextID++
 }

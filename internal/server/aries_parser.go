@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/fatih/color"
@@ -15,27 +17,38 @@ import (
 	"golang.org/x/text/language"
 )
 
-type AriesParser struct {
+type Client struct {
 	conn          net.Conn
 	server        *server
 	messageBuffer []byte
 	currentUser   *User
 	isGps         bool
+	status        string // "Idle" or "In Game"
 	remoteAddr    string
+	remoteKey     string
+	currentRoom   *Room
+	currentGame   *Game
 }
 
-func NewAriesParser(conn net.Conn, s *server) *AriesParser {
-	return &AriesParser{
+func NewClient(conn net.Conn, s *server) *Client {
+	remoteAddr := conn.RemoteAddr().String()
+	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		remoteAddr = tcpAddr.IP.String()
+	}
+
+	return &Client{
 		conn:          conn,
 		server:        s,
 		messageBuffer: make([]byte, 0),
 		currentUser:   nil,
 		isGps:         false,
-		remoteAddr:    conn.RemoteAddr().(*net.TCPAddr).IP.String(),
+		status:        "Idle",
+		remoteAddr:    remoteAddr,
+		remoteKey:     conn.RemoteAddr().String(),
 	}
 }
 
-func (s *AriesParser) parse(data []byte) {
+func (s *Client) parse(data []byte) {
 	s.messageBuffer = append(s.messageBuffer, data...)
 	for len(s.messageBuffer) >= 12 {
 		messageSize := binary.BigEndian.Uint32(s.messageBuffer[8:12])
@@ -66,7 +79,7 @@ func parseKeyValueString(input string) map[string]string {
 	return result
 }
 
-func (s *AriesParser) parseMessage(message []byte) {
+func (s *Client) parseMessage(message []byte) {
 	kind := string(message[0:4])
 	packetSize := binary.BigEndian.Uint32(message[8:12])
 	content := ""
@@ -78,9 +91,9 @@ func (s *AriesParser) parseMessage(message []byte) {
 	username := ""
 	if s.currentUser != nil {
 		username = s.currentUser.Name
-		if s.isGps {
-			username = color.RedString(" [GPS]")
-		}
+	}
+	if s.isGps {
+		username += color.RedString(" [GPS]")
 	}
 
 	slog.Debug(fmt.Sprintf("%s %s\n%s",
@@ -96,12 +109,24 @@ func (s *AriesParser) parseMessage(message []byte) {
 		s.dirResponse(kind, parseKeyValueString(content))
 	case "sele":
 		s.seleResponse(kind)
+	case "gpss":
+		s.gpssResponse(kind, parseKeyValueString(content))
 	case "gpsc":
-		s.sendSes(parseKeyValueString(content))
+		s.gpscResponse(parseKeyValueString(content))
+	case "gcre":
+		s.gcreResponse(parseKeyValueString(content))
+	case "gget":
+		s.ggetResponse(parseKeyValueString(content))
+	case "gjoi":
+		s.gjoiResponse(parseKeyValueString(content))
+	case "gsta":
+		s.send(kind, nil)
 	case "llvl":
 		s.llvlResponse(kind)
 	case "glea":
+		s.gleaResponse(kind)
 	case "gdel":
+		s.gdelResponse(kind)
 	case "cper":
 	case "llvs":
 		s.dummyResponse(kind)
@@ -120,7 +145,13 @@ func (s *AriesParser) parseMessage(message []byte) {
 	}
 }
 
-func (s *AriesParser) authResponse(kind string, params map[string]string) {
+func (s *Client) authResponse(kind string, params map[string]string) {
+	if params["VERS"] == "PSP/MOHGPS071" {
+		s.isGps = true
+		s.status = "Idle"
+		slog.Info("GPS Host registered", "name", params["NAME"], "remoteAddr", s.remoteAddr)
+	}
+
 	name := strings.TrimPrefix(params["NAME"], "@")
 	encryptedPass := params["PASS"]
 
@@ -160,19 +191,19 @@ func (s *AriesParser) authResponse(kind string, params map[string]string) {
 	s.send(kind, content)
 }
 
-func (s *AriesParser) persResponse(kind string, params map[string]string) {
+func (s *Client) persResponse(kind string, params map[string]string) {
 	persona := params["PERS"]
 
-	name := "Player"
+	displayName := "Player"
 	if s.currentUser != nil {
-		name = cases.Title(language.English).String(s.currentUser.Name)
+		displayName = s.currentUser.DisplayName
 	}
 
 	content := map[string]string{
 		"LKEY":      "95feb0c73354764fc8446aee5644c429bc9ce4ddb6fe4d953e897e05f717a9c",
 		"LOC":       "enCZ",
 		"A":         s.remoteAddr,
-		"PERS":      name,
+		"PERS":      displayName,
 		"LA":        s.remoteAddr,
 		"IDLE":      "100000",
 		"EX-ticker": "",
@@ -183,52 +214,88 @@ func (s *AriesParser) persResponse(kind string, params map[string]string) {
 	}
 
 	s.send(kind, content)
-	s.sendWho()
 }
 
-func (s *AriesParser) sendWho() {
+func (s *Client) sendWho() {
 	name := "Player"
+	displayName := "Player"
 	if s.currentUser != nil {
-		name = cases.Title(language.English).String(s.currentUser.Name)
+		name = s.currentUser.Name
+		displayName = s.currentUser.DisplayName
+		displayName = quoteProtocolName(displayName)
+		if s.isGps {
+			name = "@" + name
+			displayName = "@" + displayName
+		}
+	}
+
+	gameID := "0"
+	if s.currentGame != nil {
+		gameID = fmt.Sprintf("%d", s.currentGame.ID)
+	}
+
+	roomID := "0"
+	roomType := "0"
+	roomName := "0"
+	roomFlags := "0"
+	if s.currentRoom != nil {
+		roomID = fmt.Sprintf("%d", s.currentRoom.ID)
+		roomType = "1"
+		roomName = "room"
+		roomFlags = "C"
 	}
 
 	content := map[string]string{
-		"I":   "71615",
-		"N":   name,
-		"F":   "U",
-		"P":   "211",
-		"S":   "1,2,3,4,5,6,7,493E0,C350",
-		"X":   "0",
-		"G":   "0",
-		"AT":  "",
-		"CL":  "511",
-		"LV":  "1049601",
-		"MD":  "0",
-		"R":   "0",
-		"US":  "0",
-		"HW":  "0",
-		"RP":  "0",
-		"LO":  "enCZ",
-		"CI":  "0",
-		"CT":  "0",
+		"I":   "71615",                    // ID
+		"M":   name,                       // Account
+		"N":   displayName,                // Name
+		"F":   "U",                        // Flags
+		"P":   "211",                      // Persona
+		"S":   "1,2,3,4,5,6,7,493E0,C350", // Status
+		"X":   "0",                        // Extended info
+		"G":   gameID,                     // Current game
+		"AT":  "",                         // Attributes
+		"CL":  "511",                      // Color
+		"LV":  "1049601",                  // Level
+		"MD":  "0",                        // Model/Data
+		"R":   "0",                        // Rank
+		"US":  "0",                        // Usage system usage flags
+		"HW":  "0",                        // Hardware flags
+		"RP":  "0",                        // Reputation
+		"LO":  "enCZ",                     // Locale
+		"CI":  "0",                        // Country ID
+		"CT":  "0",                        // Connection Type
 		"A":   s.remoteAddr,
 		"LA":  s.remoteAddr,
 		"C":   "4000,,7,1,1,,1,1,5553",
-		"RI":  "0",
-		"RT":  "0",
-		"RG":  "0",
-		"RGC": "0",
-		"RM":  "0",
-		"RF":  "0",
+		"RI":  roomID,    // Room ID
+		"RT":  roomType,  // Room Type
+		"RG":  "0",       // Region
+		"RGC": "0",       // Region category
+		"RM":  roomName,  // Room name
+		"RF":  roomFlags, // Room flags
 	}
 	s.send("+who", content)
 }
 
-func (s *AriesParser) dirResponse(kind string, params map[string]string) {
+func (s *Client) sendRom() {
+	roomID := "1"
+	if s.currentRoom != nil {
+		roomID = fmt.Sprintf("%d", s.currentRoom.ID)
+	}
+	content := map[string]string{
+		"I": roomID,
+		"N": "room",
+	}
+	s.send("+rom", content)
+}
+
+func (s *Client) dirResponse(kind string, params map[string]string) {
 	version := params["VERS"]
 
 	if version == "PSP/MOHGPS071" {
 		s.isGps = true
+		s.status = "Idle"
 	}
 
 	content := map[string]string{
@@ -238,23 +305,45 @@ func (s *AriesParser) dirResponse(kind string, params map[string]string) {
 	s.send(kind, content)
 }
 
-func (s *AriesParser) seleResponse(kind string) {
+func (s *Client) seleResponse(kind string) {
 	content := map[string]string{
 		"MORE":  "0",
 		"SLOTS": "4",
 		"STATS": "0",
 	}
 	s.send(kind, content)
+	s.sendWho()
+	s.sendRom()
 }
 
-func (s *AriesParser) gseaResponse(kind string) {
+func (s *Client) gpssResponse(kind string, params map[string]string) {
+	status := params["STATUS"]
+	switch status {
+	case "A":
+		s.status = "Idle"
+	case "G":
+		s.status = "In Game"
+	}
+	s.send(kind, nil)
+}
+
+func (s *Client) gseaResponse(kind string) {
+	games := s.server.activeGames()
+	sort.Slice(games, func(i, j int) bool {
+		return games[i].ID < games[j].ID
+	})
+
 	content := map[string]string{
-		"COUNT": "0",
+		"COUNT": fmt.Sprintf("%d", len(games)),
 	}
 	s.send(kind, content)
+
+	for _, game := range games {
+		s.send("+gam", s.gameSummary(game))
+	}
 }
 
-func (s *AriesParser) newsResponse(kind string) {
+func (s *Client) newsResponse(kind string) {
 	content := map[string]string{
 		"BUDDY_SERVER": s.remoteAddr,
 		"BUDDY_PORT":   s.server.tcpPort,
@@ -262,14 +351,14 @@ func (s *AriesParser) newsResponse(kind string) {
 	s.send(kind, content)
 }
 
-func (s *AriesParser) skeyResponse(kind string) {
+func (s *Client) skeyResponse(kind string) {
 	content := map[string]string{
 		"SKEY": "$51ba8aee64ddfacae5baefa6bf61e009",
 	}
 	s.send(kind, content)
 }
 
-func (s *AriesParser) llvlResponse(kind string) {
+func (s *Client) llvlResponse(kind string) {
 	content := map[string]string{
 		"SKILL_PTS": "211",
 		"SKILL_LVL": "1049601",
@@ -278,65 +367,314 @@ func (s *AriesParser) llvlResponse(kind string) {
 	s.send(kind, content)
 }
 
-func (s *AriesParser) dummyResponse(kind string) {
+func (s *Client) dummyResponse(kind string) {
 	content := map[string]string{
 		"DUMMY": "DUMMY",
 	}
 	s.send(kind, content)
 }
 
-func (s *AriesParser) sendSes(receivedContent map[string]string) {
-	name := "Player"
-	if s.currentUser != nil {
-		name = cases.Title(language.English).String(s.currentUser.Name)
+func (s *Client) gpscResponse(params map[string]string) {
+	host := s.server.getFreeGpsHost()
+	if host == nil {
+		slog.Warn("Received gpsc but no free GPS host is available")
+		s.send("gpscnfnd", nil)
+		return
 	}
 
-	content := map[string]string{
-		"IDENT":       "12",
-		"NAME":        name,
-		"HOST":        name,
-		"GPSHOST":     name,
-		"PARAMS":      receivedContent["PARAMS"],
-		"ROOM":        "13",
-		"CUSTFLAGS":   "0",
-		"SYSFLAGS":    "262656",
-		"COUNT":       "1",
-		"PRIV":        "0",
-		"MINSIZE":     "0",
-		"MAXSIZE":     "33",
-		"NUMPART":     "1",
-		"SEED":        "012345",
-		"WHEN":        "2009.2.8-9:44:15",
-		"GAMEPORT":    s.server.tcpPort,
-		"VOIPPORT":    s.server.tcpPort,
-		"OPID0":       "0",
-		"OPPO0":       name,
-		"ADDR0":       s.remoteAddr,
-		"LADDR0":      s.remoteAddr,
-		"MADDR0":      "$0017ab8f4451",
-		"OPPARAM0":    "AAAAAAAAAAAAAAAAAAAAAQBuDCgAAAAC",
-		"PARTSIZE0":   "16",
-		"PARTPARAMS0": "0",
+	room := s.server.createRoom(host)
+	s.currentRoom = room
+	s.status = "In Game"
+
+	room.mu.Lock()
+	room.Clients[s.remoteKey] = s
+	room.mu.Unlock()
+
+	s.send("gpsc", nil)
+
+	creParams := map[string]string{
+		"MINSIZE":  params["MINSIZE"],
+		"PASS":     params["PASS"],
+		"SYSFLAGS": params["SYSFLAGS"],
+		"PARAMS":   params["PARAMS"],
+		"MAXSIZE":  params["MAXSIZE"],
+		"NAME":     params["NAME"],
 	}
-	s.send("+ses", content)
+	host.send("$cre", creParams)
 }
 
-func (s *AriesParser) send(kind string, content map[string]string) {
-	var msgBuffer bytes.Buffer
+func (s *Client) gcreResponse(params map[string]string) {
+	game := s.server.createGame(s, params)
 
-	keys := make([]string, 0, len(content))
-	for k := range content {
-		keys = append(keys, k)
+	s.send("gcre", nil)
+	s.sendWho()
+	s.sendMgm()
+	s.sendRom()
+
+	waitingClients := game.waitingClients()
+	for _, client := range waitingClients {
+		game.addClient(client)
+		client.sendSes()
 	}
 
-	for i, key := range keys {
-		fmt.Fprintf(&msgBuffer, "%s=%s", key, content[key])
-		if i < len(keys)-1 {
-			msgBuffer.WriteString("\n")
+	if len(waitingClients) > 0 {
+		s.sendMgm()
+		s.sendSes()
+	}
+}
+
+func (s *Client) ggetResponse(params map[string]string) {
+	game := s.server.findGame(params, s)
+	if game == nil {
+		s.send("gget", nil)
+		return
+	}
+
+	s.send("gget", s.gameInfo(game))
+}
+
+func (s *Client) gjoiResponse(params map[string]string) {
+	game := s.server.findGame(params, s)
+	if game == nil {
+		s.send("gjoiugam", nil)
+		return
+	}
+
+	if game.Pass != "" && params["PASS"] != "" && params["PASS"] != game.Pass {
+		s.send("gjoipass", nil)
+		return
+	}
+
+	if game.playerCount() >= game.MaxSize {
+		s.send("gjoifull", nil)
+		return
+	}
+
+	if s.currentGame != nil && s.currentGame != game {
+		if oldGame := s.server.removeClientFromGame(s); oldGame != nil && oldGame.Host != nil {
+			oldGame.Host.sendMgm()
+			oldGame.Host.sendSes()
 		}
 	}
 
-	msgBuffer.WriteByte(0)
+	game.addClient(s)
+	s.send("gjoi", nil)
+
+	if game.Host != nil {
+		game.Host.sendMgm()
+		game.Host.sendSes()
+	}
+	s.sendSes()
+}
+
+func (s *Client) gleaResponse(kind string) {
+	if game := s.server.removeClientFromGame(s); game != nil && game.Host != nil {
+		game.Host.sendMgm()
+		game.Host.sendSes()
+	}
+	s.send(kind, nil)
+}
+
+func (s *Client) gdelResponse(kind string) {
+	if s.currentGame != nil && s.currentGame.Host == s {
+		s.server.deleteGame(s.currentGame)
+	}
+	s.send(kind, nil)
+}
+
+func (g *Game) waitingClients() []*Client {
+	if g.Room == nil {
+		return nil
+	}
+
+	g.Room.mu.RLock()
+	defer g.Room.mu.RUnlock()
+
+	keys := make([]string, 0, len(g.Room.Clients))
+	for key := range g.Room.Clients {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	clients := make([]*Client, 0, len(keys))
+	for _, key := range keys {
+		clients = append(clients, g.Room.Clients[key])
+	}
+	return clients
+}
+
+func (s *Client) sendMgm() {
+	if s.currentGame == nil {
+		slog.Warn("Cannot send +mgm: client is not in a game", "remoteAddr", s.remoteKey)
+		return
+	}
+	s.send("+mgm", s.gameInfo(s.currentGame))
+}
+
+func (s *Client) sendSes() {
+	if s.currentGame == nil {
+		slog.Warn("Cannot send +ses: client is not in a game", "remoteAddr", s.remoteKey)
+		return
+	}
+	s.send("+ses", s.gameInfo(s.currentGame))
+}
+
+func (s *Client) gameSummary(game *Game) map[string]string {
+	game.mu.RLock()
+	defer game.mu.RUnlock()
+
+	sysflags := game.Sysflags
+	if game.Pass != "" {
+		if flags, err := strconv.Atoi(sysflags); err == nil {
+			sysflags = strconv.Itoa(flags | (1 << 16))
+		}
+	}
+
+	return map[string]string{
+		"IDENT":    fmt.Sprintf("%d", game.ID),
+		"NAME":     game.Name,
+		"PARAMS":   game.Params,
+		"SYSFLAGS": sysflags,
+		"COUNT":    fmt.Sprintf("%d", game.playerCountLocked()),
+		"MAXSIZE":  fmt.Sprintf("%d", game.MaxSize),
+	}
+}
+
+func (s *Client) gameInfo(game *Game) map[string]string {
+	game.mu.RLock()
+	defer game.mu.RUnlock()
+
+	roomID := "1"
+	if game.Room != nil {
+		roomID = fmt.Sprintf("%d", game.Room.ID)
+	}
+
+	auth := ""
+	if game.Sysflags == "262656" {
+		auth = "098f6bcd4621d373cade4e832627b4f6"
+	}
+
+	content := map[string]string{
+		"IDENT":      fmt.Sprintf("%d", game.ID),
+		"NAME":       game.Name,
+		"HOST":       game.Host.personaName(true),
+		"PARAMS":     game.Params,
+		"PLATPARAMS": "0",
+		"ROOM":       roomID,
+		"CUSTFLAGS":  "413082880",
+		"SYSFLAGS":   game.Sysflags,
+		"COUNT":      fmt.Sprintf("%d", game.playerCountLocked()),
+		"PRIV":       "0",
+		"MINSIZE":    fmt.Sprintf("%d", game.MinSize),
+		"MAXSIZE":    fmt.Sprintf("%d", game.MaxSize),
+		"NUMPART":    "1",
+		"SEED":       "3",
+		"WHEN":       game.CreatedAt.Format("2006.1.2-15:04:05"),
+		"AUTH":       auth,
+		"SESS":       "0",
+		"EVID":       "0",
+		"EVGID":      "0",
+	}
+
+	players := game.playersLocked()
+	for idx, player := range players {
+		isHost := idx == 0
+		idxStr := strconv.Itoa(idx)
+		content["OPID"+idxStr] = player.userID()
+		content["OPPO"+idxStr] = player.personaName(isHost)
+		content["ADDR"+idxStr] = player.remoteAddr
+		content["LADDR"+idxStr] = player.remoteAddr
+		content["MADDR"+idxStr] = ""
+		content["OPPART"+idxStr] = "0"
+		content["OPPARAM"+idxStr] = player.opParam()
+		content["OPFLAG"+idxStr] = "413082880"
+		content["OPFLAGS"+idxStr] = "413082880"
+		content["PRES"+idxStr] = "0"
+		content["PARTSIZE"+idxStr] = fmt.Sprintf("%d", game.MaxSize)
+		content["PARTPARAMS"+idxStr] = ""
+	}
+
+	return content
+}
+
+func (g *Game) playerCountLocked() int {
+	count := len(g.Clients)
+	if g.Host != nil {
+		count++
+	}
+	return count
+}
+
+func (g *Game) playersLocked() []*Client {
+	players := make([]*Client, 0, g.playerCountLocked())
+	if g.Host != nil {
+		players = append(players, g.Host)
+	}
+
+	keys := make([]string, 0, len(g.Clients))
+	for key := range g.Clients {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		players = append(players, g.Clients[key])
+	}
+	return players
+}
+
+func (s *Client) userID() string {
+	if s.currentUser == nil {
+		return "0"
+	}
+	return fmt.Sprintf("%d", s.currentUser.ID)
+}
+
+func (s *Client) personaName(host bool) string {
+	name := "Player"
+	if s.currentUser != nil {
+		name = s.currentUser.DisplayName
+	}
+
+	name = quoteProtocolName(name)
+	if host {
+		return "@" + name
+	}
+	return name
+}
+
+func quoteProtocolName(name string) string {
+	if strings.Contains(name, " ") && !(strings.HasPrefix(name, "\"") && strings.HasSuffix(name, "\"")) {
+		return "\"" + name + "\""
+	}
+	return name
+}
+
+func (s *Client) opParam() string {
+	if s.isGps {
+		return "AAAAAAAAAAAAAAAARUQAAAUAAAABAAAA"
+	}
+	return "AAAAAAAAAAAAAAAAWkMAAAUAAAABAAAA"
+}
+
+func (s *Client) send(kind string, content map[string]string) {
+	var msgBuffer bytes.Buffer
+
+	if len(content) > 0 {
+		keys := make([]string, 0, len(content))
+		for k := range content {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for i, key := range keys {
+			fmt.Fprintf(&msgBuffer, "%s=%s", key, content[key])
+			if i < len(keys)-1 {
+				msgBuffer.WriteString("\n")
+			}
+		}
+
+		msgBuffer.WriteByte(0)
+	}
 
 	buffer := make([]byte, len(msgBuffer.Bytes())+12)
 	copy(buffer, kind)
@@ -347,9 +685,9 @@ func (s *AriesParser) send(kind string, content map[string]string) {
 	username := ""
 	if s.currentUser != nil {
 		username = s.currentUser.Name
-		if s.isGps {
-			username = color.RedString(" [GPS]")
-		}
+	}
+	if s.isGps {
+		username += color.RedString(" [GPS]")
 	}
 
 	slog.Debug(fmt.Sprintf("%s %s\n%s",
