@@ -13,7 +13,7 @@ import (
 func (s *server) StartUDPServer(port string) {
 	ln, err := net.ListenPacket("udp", ":"+port)
 	if err != nil {
-		slog.Error("Could not start UDP server", "addr", ln.LocalAddr(), "err", err)
+		slog.Error("Could not start UDP server", "port", port, "err", err)
 		os.Exit(1)
 	}
 

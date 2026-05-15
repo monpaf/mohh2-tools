@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,29 +114,33 @@ func sameUser(a, b *Client) bool {
 }
 
 type server struct {
-	mu         sync.RWMutex
-	rooms      map[int]*Room
-	nextRoomID int
-	games      map[int]*Game
-	nextGameID int
-	clients    map[string]*Client
-	sslPort    string
-	tcpPort    string
-	udpPort    string
-	db         *memoryDB
+	mu           sync.RWMutex
+	rooms        map[int]*Room
+	nextRoomID   int
+	games        map[int]*Game
+	nextGameID   int
+	clients      map[string]*Client
+	sslPort      string
+	tcpPort      string
+	udpPort      string
+	tcpHostIP    string
+	db           *memoryDB
+	uhsProxyPort int
 }
 
-func newServer(sslPort, tcpPort, udpPort string) *server {
+func newServer(sslPort, tcpPort, udpPort, tcpHostIP string, uhsProxyPort int) *server {
 	return &server{
-		rooms:      make(map[int]*Room),
-		nextRoomID: 1,
-		games:      make(map[int]*Game),
-		nextGameID: 1,
-		clients:    make(map[string]*Client),
-		sslPort:    sslPort,
-		tcpPort:    tcpPort,
-		udpPort:    udpPort,
-		db:         newDB(),
+		rooms:        make(map[int]*Room),
+		nextRoomID:   1,
+		games:        make(map[int]*Game),
+		nextGameID:   1,
+		clients:      make(map[string]*Client),
+		sslPort:      sslPort,
+		tcpPort:      tcpPort,
+		udpPort:      udpPort,
+		tcpHostIP:    tcpHostIP,
+		db:           newDB(),
+		uhsProxyPort: uhsProxyPort,
 	}
 }
 
@@ -310,9 +316,7 @@ func (s *server) deleteGame(game *Game) {
 	game.mu.Unlock()
 }
 
-func Serve(sslPort, tcpPort, udpPort, logLevel string) {
-	s := newServer(sslPort, tcpPort, udpPort)
-
+func Serve(sslPort, tcpPort, udpPort, logLevel, tcpHostIP, uhsProxyListen, uhsProxyTarget string) {
 	lvl := new(slog.LevelVar)
 	logger := slog.New(
 		tint.NewHandler(color.Output, &tint.Options{
@@ -335,10 +339,36 @@ func Serve(sslPort, tcpPort, udpPort, logLevel string) {
 		lvl.Set(slog.LevelInfo)
 	}
 
+	if tcpHostIP == "" {
+		tcpHostIP = os.Getenv("TCP_HOST_IP")
+	}
+	if tcpHostIP == "" {
+		tcpHostIP = detectLocalIPv4()
+	}
+	uhsProxyPort := 0
+	if uhsProxyTarget != "" {
+		uhsProxyPort = portFromListenAddress(uhsProxyListen)
+	}
+
+	if uhsProxyPort > 0 {
+		slog.Info("UHS proxy params rewrite enabled", "port", uhsProxyPort)
+	}
+	if uhsProxyTarget != "" {
+		slog.Info("UHS proxy enabled", "listen", uhsProxyListen, "target", uhsProxyTarget)
+	}
+	if tcpHostIP != "" {
+		slog.Info("TCP host IP selected", "tcpHostIP", tcpHostIP)
+	}
+
+	s := newServer(sslPort, tcpPort, udpPort, tcpHostIP, uhsProxyPort)
+
 	var wg sync.WaitGroup
 
 	// wg.Add(3)
 	wg.Add(2)
+	if uhsProxyTarget != "" {
+		wg.Add(1)
+	}
 
 	go func() {
 		defer wg.Done()
@@ -348,11 +378,77 @@ func Serve(sslPort, tcpPort, udpPort, logLevel string) {
 		defer wg.Done()
 		s.StartTCPServer(tcpPort)
 	}()
+	if uhsProxyTarget != "" {
+		go func() {
+			defer wg.Done()
+			if err := runUHSProxy(context.Background(), uhsProxyListen, uhsProxyTarget); err != nil {
+				slog.Error("Could not start UHS proxy", "err", err)
+				os.Exit(1)
+			}
+		}()
+	}
 	// go func() {
 	// 	defer wg.Done()
 	// 	s.StartUDPServer(udpPort)
 	// }()
 	wg.Wait()
+}
+
+func portFromListenAddress(value string) int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if !strings.Contains(value, ":") {
+		value = ":" + value
+	}
+	addr, err := net.ResolveUDPAddr("udp4", value)
+	if err != nil {
+		return 0
+	}
+	return addr.Port
+}
+
+func detectLocalIPv4() string {
+	conn, err := net.Dial("udp4", "8.8.8.8:80")
+	if err == nil {
+		defer conn.Close()
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && usableIPv4(addr.IP) {
+			return addr.IP.String()
+		}
+	}
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch value := addr.(type) {
+			case *net.IPNet:
+				ip = value.IP
+			case *net.IPAddr:
+				ip = value.IP
+			}
+			if usableIPv4(ip) {
+				return ip.String()
+			}
+		}
+	}
+	return ""
+}
+
+func usableIPv4(ip net.IP) bool {
+	ip = ip.To4()
+	return ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast()
 }
 
 func (s *server) handleConnection(conn net.Conn) {

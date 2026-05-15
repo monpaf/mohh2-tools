@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/runZeroInc/excrypto/crypto/rsa"
@@ -116,7 +117,8 @@ func GenerateProtoSSLCert(domain string) (tls.Certificate, error) {
 }
 
 func (s *server) StartSSLServer(port string) {
-	cert, err := GenerateProtoSSLCert("pspmoh07.ea.com")
+	domain := certificateDomainForPort(port)
+	cert, err := GenerateProtoSSLCert(domain)
 	if err != nil {
 		slog.Error("Could not generate ProtoSSL certificate", "err", err)
 		return
@@ -139,7 +141,7 @@ func (s *server) StartSSLServer(port string) {
 		return
 	}
 
-	slog.Info("SSL server listening", "addr", ln.Addr())
+	slog.Info("SSL server listening", "addr", ln.Addr(), "certDomain", domain)
 
 	for {
 		conn, err := ln.Accept()
@@ -151,5 +153,18 @@ func (s *server) StartSSLServer(port string) {
 		slog.Info("SSL connection accepted", "localAddr", ln.Addr(), "remoteAddr", conn.RemoteAddr())
 
 		go s.handleConnection(conn)
+	}
+}
+
+func certificateDomainForPort(port string) string {
+	switch strings.TrimPrefix(strings.TrimSpace(port), ":") {
+	case "11181", "11191":
+		return "pspmoh07.ea.com"
+	case "21171":
+		return "wiimoh08.ea.com"
+	case "21181", "21191":
+		return "pspmoh08.ea.com"
+	default:
+		return "pspmoh07.ea.com"
 	}
 }

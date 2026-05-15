@@ -108,7 +108,9 @@ func (s *Client) parseMessage(message []byte) {
 	case "@dir":
 		s.dirResponse(kind, parseKeyValueString(content))
 	case "sele":
-		s.seleResponse(kind)
+		s.seleResponse(kind, parseKeyValueString(content))
+	case "PSET":
+		s.send(kind, nil)
 	case "gpss":
 		s.gpssResponse(kind, parseKeyValueString(content))
 	case "gpsc":
@@ -299,21 +301,54 @@ func (s *Client) dirResponse(kind string, params map[string]string) {
 	}
 
 	content := map[string]string{
-		"ADDR": s.remoteAddr,
+		"ADDR": s.server.tcpHostForClient(s.remoteAddr),
 		"PORT": s.server.tcpPort,
 	}
 	s.send(kind, content)
 }
 
-func (s *Client) seleResponse(kind string) {
-	content := map[string]string{
-		"MORE":  "0",
-		"SLOTS": "4",
-		"STATS": "0",
+func (s *server) tcpHostForClient(fallback string) string {
+	if s.tcpHostIP != "" {
+		return s.tcpHostIP
 	}
-	s.send(kind, content)
+	return fallback
+}
+
+func (s *Client) seleResponse(kind string, params map[string]string) {
+	stats := params["STATS"]
+	inGame := params["INGAME"]
+
+	if stats == "" && inGame == "" {
+		content := map[string]string{
+			"MORE":  "0",
+			"SLOTS": "4",
+			"STATS": "0",
+		}
+		s.send(kind, content)
+		s.sendWho()
+		s.sendRom()
+		return
+	}
+
+	content := map[string]string{
+		"INGAME": inGame,
+	}
+	if inGame == "1" {
+		content = map[string]string{
+			"INGAME":    inGame,
+			"MESGS":     params["MESGS"],
+			"MESGTYPES": params["MESGTYPES"],
+			"USERS":     params["USERS"],
+			"GAMES":     params["GAMES"],
+			"MYGAME":    params["MYGAME"],
+			"ROOMS":     params["ROOMS"],
+			"ASYNC":     params["ASYNC"],
+			"USERSETS":  params["USERSETS"],
+			"STATS":     stats,
+		}
+	}
+	s.sendWithJoiner(kind, content, " ")
 	s.sendWho()
-	s.sendRom()
 }
 
 func (s *Client) gpssResponse(kind string, params map[string]string) {
@@ -345,7 +380,7 @@ func (s *Client) gseaResponse(kind string) {
 
 func (s *Client) newsResponse(kind string) {
 	content := map[string]string{
-		"BUDDY_SERVER": s.remoteAddr,
+		"BUDDY_SERVER": s.server.tcpHostForClient(s.remoteAddr),
 		"BUDDY_PORT":   s.server.tcpPort,
 	}
 	s.send(kind, content)
@@ -533,7 +568,7 @@ func (s *Client) gameSummary(game *Game) map[string]string {
 	return map[string]string{
 		"IDENT":    fmt.Sprintf("%d", game.ID),
 		"NAME":     game.Name,
-		"PARAMS":   game.Params,
+		"PARAMS":   s.gameParamsForClient(game),
 		"SYSFLAGS": sysflags,
 		"COUNT":    fmt.Sprintf("%d", game.playerCountLocked()),
 		"MAXSIZE":  fmt.Sprintf("%d", game.MaxSize),
@@ -558,7 +593,7 @@ func (s *Client) gameInfo(game *Game) map[string]string {
 		"IDENT":      fmt.Sprintf("%d", game.ID),
 		"NAME":       game.Name,
 		"HOST":       game.Host.personaName(true),
-		"PARAMS":     game.Params,
+		"PARAMS":     s.gameParamsForClient(game),
 		"PLATPARAMS": "0",
 		"ROOM":       roomID,
 		"CUSTFLAGS":  "413082880",
@@ -595,6 +630,29 @@ func (s *Client) gameInfo(game *Game) map[string]string {
 	}
 
 	return content
+}
+
+func (s *Client) gameParamsForClient(game *Game) string {
+	if game == nil {
+		return ""
+	}
+	if s.isGps || s.server.uhsProxyPort <= 0 {
+		return game.Params
+	}
+	if game.Params == "" {
+		return ""
+	}
+
+	const uhsUDPPortParamIndex = 10
+
+	parts := strings.Split(game.Params, ",")
+	for len(parts) <= uhsUDPPortParamIndex {
+		parts = append(parts, "")
+	}
+
+	parts[uhsUDPPortParamIndex] = strconv.FormatInt(int64(s.server.uhsProxyPort), 16)
+
+	return strings.Join(parts, ",")
 }
 
 func (g *Game) playerCountLocked() int {
@@ -657,6 +715,10 @@ func (s *Client) opParam() string {
 }
 
 func (s *Client) send(kind string, content map[string]string) {
+	s.sendWithJoiner(kind, content, "\n")
+}
+
+func (s *Client) sendWithJoiner(kind string, content map[string]string, joiner string) {
 	var msgBuffer bytes.Buffer
 
 	if len(content) > 0 {
@@ -669,18 +731,14 @@ func (s *Client) send(kind string, content map[string]string) {
 		for i, key := range keys {
 			fmt.Fprintf(&msgBuffer, "%s=%s", key, content[key])
 			if i < len(keys)-1 {
-				msgBuffer.WriteString("\n")
+				msgBuffer.WriteString(joiner)
 			}
 		}
 
 		msgBuffer.WriteByte(0)
 	}
 
-	buffer := make([]byte, len(msgBuffer.Bytes())+12)
-	copy(buffer, kind)
-	binary.BigEndian.PutUint32(buffer[4:], 0)
-	binary.BigEndian.PutUint32(buffer[8:], uint32(len(buffer)))
-	copy(buffer[12:], msgBuffer.Bytes())
+	buffer := buildPacket(kind, msgBuffer.Bytes())
 
 	username := ""
 	if s.currentUser != nil {
@@ -700,4 +758,15 @@ func (s *Client) send(kind string, content map[string]string) {
 		slog.Error("Could not write to TCP connection", "err", err)
 		return
 	}
+}
+
+func buildPacket(kind string, payload []byte) []byte {
+	buffer := make([]byte, len(payload)+12)
+	copy(buffer, kind)
+	if len(kind) == 4 {
+		binary.BigEndian.PutUint32(buffer[4:], 0)
+	}
+	binary.BigEndian.PutUint32(buffer[8:], uint32(len(buffer)))
+	copy(buffer[12:], payload)
+	return buffer
 }

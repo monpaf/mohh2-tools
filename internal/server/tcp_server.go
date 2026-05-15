@@ -9,7 +9,7 @@ import (
 func (s *server) StartTCPServer(port string) {
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		slog.Error("Could not start TCP server", "addr", ln.Addr(), "err", err)
+		slog.Error("Could not start TCP server", "port", port, "err", err)
 		os.Exit(1)
 	}
 
